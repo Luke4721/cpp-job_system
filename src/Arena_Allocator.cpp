@@ -63,11 +63,15 @@ void arena_destroy(T* obj)
     if (obj)
         obj->~T();
 }
+struct JobCounter {
+    int remaining;
+};
 //Job Structure 
 struct Job
 {
     void (*fn)(void*);
     void* data;
+    JobCounter* counter;
 };
 struct SumJobData {
     int* array;
@@ -78,7 +82,7 @@ struct SumJobData {
         : array(array), count(count), result(result) {}
 };
 
-
+//Sum job
 void sum_job(void* ptr)
 {
     auto* data = static_cast<SumJobData*>(ptr);
@@ -91,16 +95,38 @@ void sum_job(void* ptr)
     }
     *data->result = sum;
 }
+void execute_job(Job& job)
+{
+    job.fn(job.data);
+    if (job.counter)
+    {
+        --job.counter->remaining;
+    }
+}
+
 int main()
 {
+    JobCounter counter;
+    counter.remaining = 2;
     Arena frameArena(1024);
-    int values [] = {1,2,3,4,5};
-    int result =0;
-    auto* payload = arena_allocate<SumJobData>(frameArena, values, 5, &result);
-    Job job;
-    job.fn = &sum_job;
-    job.data = payload;
-    job.fn(job.data);
+    int a[] = {1,2,3};
+    int b[] = {4,5,6};
+    int out1 = 0;
+    int out2 = 0;
 
-    frameArena.reset();
+    auto* p1 = arena_allocate<SumJobData>(frameArena, a, 3, &out1);
+    auto* p2 = arena_allocate<SumJobData>(frameArena, b, 3, &out2);
+
+    Job jobs[2];
+    jobs[0] = Job{sum_job, p1, &counter};
+    jobs[1] = Job{sum_job, p2, &counter};
+
+    for(auto& job : jobs)
+    {
+        execute_job(job);
+    }
+    if(counter.remaining == 0)
+    {
+        frameArena.reset();
+    }
 }
