@@ -1,7 +1,6 @@
 #include <cstddef>
 #include <new>
 #include <utility> //std::forward
-
 struct Arena
 {
     void*  memory;
@@ -103,12 +102,32 @@ void execute_job(Job& job)
         --job.counter->remaining;
     }
 }
-
+void spawn_child_jobs(
+    void (*fn)(void*),
+    Job* job_list,
+    size_t& job_count,
+    void** payloads,
+    size_t count,
+    JobCounter* counter
+)
+{
+    counter->remaining += static_cast<int>(count);
+    
+    for(size_t i = 0; i < count; ++i)
+    {
+        job_list[job_count++] = Job{fn, payloads[i], counter};
+    }
+}
 int main()
 {
+    size_t next_job = 0;
+    size_t job_count = 0;   // ✅ tracks job storage
+
     JobCounter counter;
-    counter.remaining = 2;
+    counter.remaining = 0;  // ✅ start at 0
+
     Arena frameArena(1024);
+
     int a[] = {1,2,3};
     int b[] = {4,5,6};
     int out1 = 0;
@@ -117,15 +136,23 @@ int main()
     auto* p1 = arena_allocate<SumJobData>(frameArena, a, 3, &out1);
     auto* p2 = arena_allocate<SumJobData>(frameArena, b, 3, &out2);
 
-    Job jobs[2];
-    jobs[0] = Job{sum_job, p1, &counter};
-    jobs[1] = Job{sum_job, p2, &counter};
+    Job jobs[8]; // small buffer for now
 
-    for(auto& job : jobs)
+    // Initial jobs = future work → increment counter
+    counter.remaining += 2;
+
+    jobs[job_count++] = Job{sum_job, p1, &counter};
+    jobs[job_count++] = Job{sum_job, p2, &counter};
+
+    // ✅ robust execution loop
+    while (next_job < job_count)
     {
-        execute_job(job);
+        execute_job(jobs[next_job]);
+        ++next_job;
     }
-    if(counter.remaining == 0)
+
+    // ✅ completion check
+    if (counter.remaining == 0)
     {
         frameArena.reset();
     }
