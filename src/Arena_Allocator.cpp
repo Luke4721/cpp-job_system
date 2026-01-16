@@ -1,6 +1,12 @@
 #include <cstddef>
 #include <new>
 #include <utility> //std::forward
+#include <atomic>
+#include <thread>
+#include <vector>
+
+constexpr size_t MAX_JOBS{64}; // Job systems must fail loudly if job storage overflows. Silent overflow is instant UB
+
 struct Arena
 {
     void*  memory;
@@ -63,7 +69,8 @@ void arena_destroy(T* obj)
         obj->~T();
 }
 struct JobCounter {
-    int remaining;
+    std::atomic<int> remaining;
+    JobCounter() : remaining(0) {}
 };
 //Job Structure 
 struct Job
@@ -99,7 +106,7 @@ void execute_job(Job& job)
     job.fn(job.data);
     if (job.counter)
     {
-        --job.counter->remaining;
+        job.counter->remaining.fetch_sub(1, std::memory_order_relaxed);
     }
 }
 void spawn_child_jobs(
@@ -111,20 +118,48 @@ void spawn_child_jobs(
     JobCounter* counter
 )
 {
-    counter->remaining += static_cast<int>(count);
+    if(job_count + count > MAX_JOBS) // assuming MAX_JOBS is 64
+    {
+        // Handle overflow, e.g., throw an error or log
+        return;
+    }
     
+    counter->remaining.fetch_add(static_cast<int>(count), std::memory_order_relaxed);
+
     for(size_t i = 0; i < count; ++i)
     {
         job_list[job_count++] = Job{fn, payloads[i], counter};
     }
 }
+
+//Thread function
+void worker_thread(
+    Job* jobs,//Available Jobs
+    size_t job_count,//Total Number of Jobs
+    std::atomic<size_t>& next_job//Reference to the next_job variable in the main function
+)
+{
+    while (true)
+    {
+        //Getting the index position of the next_job
+        size_t index{next_job.fetch_add(1,std::memory_order_relaxed)};
+        if(index >= job_count)//To check that if we are not going out of index (we start from 0 to n-1)
+        {
+            break;
+        }
+
+        execute_job(jobs[index]);//Execute the next job through the next available thread
+    }
+}
+
 int main()
 {
-    size_t next_job = 0;
-    size_t job_count = 0;   // ✅ tracks job storage
-
+    const unsigned int worker_count {std::thread::hardware_concurrency() > 1? std::thread::hardware_concurrency() - 1:1};//getting the hint towards the available number of threads
+    std::vector<std::thread> workers;//Created a dynamic array to store threads
+    std::atomic<size_t> next_job {0};
+    size_t job_count {0};   // ✅ tracks job storage
     JobCounter counter;
-    counter.remaining = 0;  // ✅ start at 0
+    counter.remaining.store(0, std::memory_order_relaxed);  // ✅ start at 0
 
     Arena frameArena(1024);
 
@@ -136,24 +171,39 @@ int main()
     auto* p1 = arena_allocate<SumJobData>(frameArena, a, 3, &out1);
     auto* p2 = arena_allocate<SumJobData>(frameArena, b, 3, &out2);
 
-    Job jobs[8]; // small buffer for now
+    Job jobs[MAX_JOBS]; // small buffer for now
 
     // Initial jobs = future work → increment counter
-    counter.remaining += 2;
+    counter.remaining.fetch_add(2, std::memory_order_relaxed);
 
     jobs[job_count++] = Job{sum_job, p1, &counter};
     jobs[job_count++] = Job{sum_job, p2, &counter};
 
-    // ✅ robust execution loop
-    while (next_job < job_count)
+    //---- Launching worker threads ----
+    for(unsigned int i =0; i<worker_count; ++i)
     {
-        execute_job(jobs[next_job]);
-        ++next_job;
+        workers.emplace_back(
+            worker_thread,
+            jobs,
+            job_count,
+            std::ref(next_job)
+
+        );
+    }
+
+
+    worker_thread(jobs,job_count,next_job);
+
+    //wait for all worker
+    for (auto& t :workers)
+    {
+        t.join();
     }
 
     // ✅ completion check
-    if (counter.remaining == 0)
+    if ((counter.remaining.load(std::memory_order_relaxed)) == 0)
     {
         frameArena.reset();
     }
 }
+
