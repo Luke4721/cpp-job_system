@@ -72,41 +72,94 @@ struct JobCounter {
     std::atomic<int> remaining;
     JobCounter() : remaining(0) {}
 };
+struct JobContext;
 //Job Structure 
 struct Job
 {
     void (*fn)(void*);
     void* data;
     JobCounter* counter;
+    JobContext* ctx;
+};
+
+struct JobContext{
+    Job* jobs;
+    std::atomic<size_t>* job_count;
+    Arena* arena;
 };
 struct SumJobData {
     int* array;
     size_t count;
-    int* result;
+    std::atomic<int>* result;
 
-    SumJobData(int* array, size_t count, int* result)
+    SumJobData(int* array, size_t count, std::atomic<int>* result)
         : array(array), count(count), result(result) {}
 };
+//Structure for the sum_job function to spawn child jobs if the payload array is big enough
+struct SumRangeJobData{
+    int* array;
+    size_t begin;
+    size_t end;
+    std::atomic<int>* result;
 
+    JobContext* ctx;
+    JobCounter* counter;
+    SumRangeJobData(
+        int* array,
+        size_t begin,
+        size_t end,
+        std::atomic<int>* result,
+
+        JobContext* ctx,
+        JobCounter* counter
+    )
+    : array(array),
+      begin(begin),
+      end(end),
+      result(result),
+      ctx(ctx),
+      counter(counter)
+      {}
+};
 //Sum job
 void sum_job(void* ptr)
 {
-    auto* data = static_cast<SumJobData*>(ptr);
-
-    int sum=0;
-
-    for(size_t i=0; i< data->count; ++i)
+    auto* data {static_cast<SumRangeJobData*>(ptr)};
+    constexpr size_t Threshold {64};
+    size_t count {data->end - data->begin};
+    if(count <= Threshold)
     {
-        sum += data->array[i];
+        int local = 0;
+        for(size_t i = data->begin;i < data->end; ++i)
+        {
+            local += data->array[i];
+        }
+        data->result->fetch_add(local,std::memory_order_relaxed);
+        return;
     }
-    *data->result = sum;
+    //Split into two child jobs
+    size_t mid {((data->begin + count)/2)};
+
+    SumRangeJobData* left = arena_allocate<SumRangeJobData>(*data->ctx->arena,data->array,data->begin,mid,data->result,data->ctx,data->counter);
+    SumRangeJobData* right = arena_allocate<SumRangeJobData>(*data->ctx->arena,data->array,mid,data->end,data->result,data->ctx,data->counter);
+
+    //Increment the counter BEFORE publishing
+    data->counter->remaining.fetch_add(2,std::memory_order_relaxed);
+
+    size_t idx = data->ctx->job_count->fetch_add(1, std::memory_order_relaxed);
+    data->ctx->jobs[idx] = Job{sum_job,left,data->counter};
+    idx = data->ctx->job_count->fetch_add(1, std::memory_order_relaxed);
+    
+    data->ctx->jobs[idx] = Job{sum_job,right,data->counter};
+
+
 }
 void execute_job(Job& job)
 {
     job.fn(job.data);
     if (job.counter)
     {
-        job.counter->remaining.fetch_sub(1, std::memory_order_relaxed);
+        job.counter->remaining.fetch_sub(1, std::memory_order_release);
     }
 }
 void spawn_child_jobs(
@@ -135,17 +188,20 @@ void spawn_child_jobs(
 //Thread function
 void worker_thread(
     Job* jobs,//Available Jobs
-    size_t job_count,//Total Number of Jobs
-    std::atomic<size_t>& next_job//Reference to the next_job variable in the main function
+    std::atomic<size_t>&job_count,//Total Number of Jobs
+    std::atomic<size_t>& next_job,//Reference to the next_job variable in the main function
+    JobCounter* counter
 )
 {
     while (true)
     {
         //Getting the index position of the next_job
         size_t index{next_job.fetch_add(1,std::memory_order_relaxed)};
-        if(index >= job_count)//To check that if we are not going out of index (we start from 0 to n-1)
+        if(index >= job_count.load(std::memory_order_relaxed))//To check that if we are not going out of index (we start from 0 to n-1)
         {
-            break;
+            if(counter->remaining.load(std::memory_order_acquire) == 0)break;
+            else continue;//If there are no remaining jobs, exit the loop
+            
         }
 
         execute_job(jobs[index]);//Execute the next job through the next available thread
@@ -157,27 +213,37 @@ int main()
     const unsigned int worker_count {std::thread::hardware_concurrency() > 1? std::thread::hardware_concurrency() - 1:1};//getting the hint towards the available number of threads
     std::vector<std::thread> workers;//Created a dynamic array to store threads
     std::atomic<size_t> next_job {0};
-    size_t job_count {0};   // ✅ tracks job storage
+    std::atomic<size_t> job_count {0};   // ✅ tracks job storage
     JobCounter counter;
     counter.remaining.store(0, std::memory_order_relaxed);  // ✅ start at 0
 
     Arena frameArena(1024);
-
     int a[] = {1,2,3};
     int b[] = {4,5,6};
-    int out1 = 0;
-    int out2 = 0;
+    std::atomic<int> out1{0};
+    std::atomic<int> out2{0};
 
     auto* p1 = arena_allocate<SumJobData>(frameArena, a, 3, &out1);
     auto* p2 = arena_allocate<SumJobData>(frameArena, b, 3, &out2);
 
     Job jobs[MAX_JOBS]; // small buffer for now
 
+    
+    JobContext ctx{
+        jobs,
+        &job_count,
+        &frameArena
+    };
+
+
     // Initial jobs = future work → increment counter
     counter.remaining.fetch_add(2, std::memory_order_relaxed);
 
-    jobs[job_count++] = Job{sum_job, p1, &counter};
-    jobs[job_count++] = Job{sum_job, p2, &counter};
+    size_t job_index = job_count.fetch_add(1, std::memory_order_relaxed);
+    jobs[job_index] = Job{sum_job, p1, &counter,&ctx};
+
+    job_index = job_count.fetch_add(1, std::memory_order_relaxed);
+    jobs[job_index] = Job{sum_job, p2, &counter,&ctx};
 
     //---- Launching worker threads ----
     for(unsigned int i =0; i<worker_count; ++i)
@@ -185,14 +251,15 @@ int main()
         workers.emplace_back(
             worker_thread,
             jobs,
-            job_count,
-            std::ref(next_job)
-
+            std::ref(job_count),
+            std::ref(next_job),
+            &counter
         );
     }
 
 
-    worker_thread(jobs,job_count,next_job);
+    worker_thread(jobs, job_count, next_job, &counter);//Main thread also works as a worker
+
 
     //wait for all worker
     for (auto& t :workers)
@@ -201,7 +268,7 @@ int main()
     }
 
     // ✅ completion check
-    if ((counter.remaining.load(std::memory_order_relaxed)) == 0)
+    if ((counter.remaining.load(std::memory_order_acquire)) == 0)
     {
         frameArena.reset();
     }
