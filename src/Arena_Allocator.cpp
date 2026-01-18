@@ -80,13 +80,30 @@ struct Job
     void* data;
     JobCounter* counter;
     JobContext* ctx;
+
+    bool is_leaf;
+};
+
+struct JobQueue //Owner Thread pushes & pops from tail. Stealers pop from head
+{
+    Job jobs[MAX_JOBS];
+    std::atomic<size_t> head;
+    std::atomic<size_t> tail;
+};
+
+struct Worker
+{
+    JobQueue queue;
+    size_t id;
+
+    
 };
 
 struct JobContext{
-    Job* jobs;
-    std::atomic<size_t>* job_count;
     Arena* arena;
+    Worker* worker;
 };
+
 struct SumJobData {
     int* array;
     size_t count;
@@ -121,6 +138,7 @@ struct SumRangeJobData{
       counter(counter)
       {}
 };
+void push_job(Worker& worker, Job job);
 //Sum job
 void sum_job(void* ptr)
 {
@@ -144,125 +162,169 @@ void sum_job(void* ptr)
     SumRangeJobData* right = arena_allocate<SumRangeJobData>(*data->ctx->arena,data->array,mid,data->end,data->result,data->ctx,data->counter);
 
     //Increment the counter BEFORE publishing
-    data->counter->remaining.fetch_add(2,std::memory_order_relaxed);
-
-    size_t idx = data->ctx->job_count->fetch_add(1, std::memory_order_relaxed);
-    data->ctx->jobs[idx] = Job{sum_job,left,data->counter};
-    idx = data->ctx->job_count->fetch_add(1, std::memory_order_relaxed);
-    
-    data->ctx->jobs[idx] = Job{sum_job,right,data->counter};
-
+    Worker* self {data->ctx->worker};
+    data->counter->remaining.fetch_add(2, std::memory_order_relaxed);
+    push_job(*self, Job{sum_job, left, data->counter, data->ctx, false});
+    push_job(*self, Job{sum_job, right, data->counter, data->ctx, false});
 
 }
 void execute_job(Job& job)
 {
     job.fn(job.data);
-    if (job.counter)
+    if (job.is_leaf&&job.counter)
     {
         job.counter->remaining.fetch_sub(1, std::memory_order_release);
     }
 }
-void spawn_child_jobs(
-    void (*fn)(void*),
-    Job* job_list,
-    size_t& job_count,
-    void** payloads,
-    size_t count,
-    JobCounter* counter
-)
-{
-    if(job_count + count > MAX_JOBS) // assuming MAX_JOBS is 64
-    {
-        // Handle overflow, e.g., throw an error or log
-        return;
-    }
-    
-    counter->remaining.fetch_add(static_cast<int>(count), std::memory_order_relaxed);
 
-    for(size_t i = 0; i < count; ++i)
+bool pop_local(JobQueue& q, Job& out)
+{
+    size_t t = q.tail.load(std::memory_order_relaxed);
+    if(t == q.head.load(std::memory_order_acquire))
     {
-        job_list[job_count++] = Job{fn, payloads[i], counter};
+        return false;
     }
+
+    t--;
+    q.tail.store(t,std::memory_order_relaxed);
+    out = q.jobs[t];
+    return true;
+}
+
+bool steal(JobQueue& victim, Job& out)
+{
+    size_t h = victim.head.load(std::memory_order_acquire);
+    size_t t = victim.tail.load(std::memory_order_acquire);
+    
+    if(h>=t)
+    {
+        return false;
+    }
+    if(!victim.head.compare_exchange_strong(
+        h,h+1,
+        std::memory_order_acq_rel
+    ))
+    {
+        return false;
+    }
+
+    out = victim.jobs[h];
+    return true;
 }
 
 //Thread function
 void worker_thread(
-    Job* jobs,//Available Jobs
-    std::atomic<size_t>&job_count,//Total Number of Jobs
-    std::atomic<size_t>& next_job,//Reference to the next_job variable in the main function
+    Worker* self,
+    Worker* all_workers,
+    size_t worker_count,
     JobCounter* counter
 )
 {
-    while (true)
+    Job job;
+    while(true)
     {
-        //Getting the index position of the next_job
-        size_t index{next_job.fetch_add(1,std::memory_order_relaxed)};
-        if(index >= job_count.load(std::memory_order_relaxed))//To check that if we are not going out of index (we start from 0 to n-1)
+        //1. Trying local work
+        if(pop_local(self->queue,job))
         {
-            if(counter->remaining.load(std::memory_order_acquire) == 0)break;
-            else continue;//If there are no remaining jobs, exit the loop
-            
+            execute_job(job);
+            continue;
+        }
+        
+        //2.Trying to steal work from other Jobs
+        bool stolen{false};
+        for(size_t i = 0; i < worker_count; ++i)
+        {
+            if(i == self->id)
+            {continue;}
+
+            if(steal(all_workers[i].queue, job))
+        {
+            execute_job(job);
+            stolen = true;
+            break;
         }
 
-        execute_job(jobs[index]);//Execute the next job through the next available thread
+        }
+
+        if(stolen)
+        {
+            continue;
+        }
+
+        //When no work is found anywhere
+        if(counter->remaining.load(std::memory_order_acquire)==0)
+        {
+            break;
+        }
     }
+}
+
+void push_job(Worker& w, Job job)
+{
+    size_t t {w.queue.tail.load(std::memory_order_relaxed)};
+    w.queue.jobs[t] = job;
+    w.queue.tail.store(t+1, std::memory_order_relaxed);
 }
 
 int main()
 {
     const unsigned int worker_count {std::thread::hardware_concurrency() > 1? std::thread::hardware_concurrency() - 1:1};//getting the hint towards the available number of threads
-    std::vector<std::thread> workers;//Created a dynamic array to store threads
-    std::atomic<size_t> next_job {0};
-    std::atomic<size_t> job_count {0};   // ✅ tracks job storage
+    std::vector<std::thread> threads;//Created a dynamic array to store threads
+    std::vector<Worker> workers(worker_count);
     JobCounter counter;
     counter.remaining.store(0, std::memory_order_relaxed);  // ✅ start at 0
 
+    for(size_t i =0; i<worker_count;++i)
+    {
+        workers[i].id = i;
+        workers[i].queue.head.store(0);
+        workers[i].queue.tail.store(0);
+    }
+
     Arena frameArena(1024);
+    
+    std::vector<JobContext> contexts(worker_count);
+
+    for(size_t i =0; i<worker_count;++i)
+    {
+        contexts[i] =  JobContext{&frameArena, &workers[i]};
+    }
+
     int a[] = {1,2,3};
     int b[] = {4,5,6};
     std::atomic<int> out1{0};
     std::atomic<int> out2{0};
 
-    auto* p1 = arena_allocate<SumJobData>(frameArena, a, 3, &out1);
-    auto* p2 = arena_allocate<SumJobData>(frameArena, b, 3, &out2);
+    auto* p1 = arena_allocate<SumRangeJobData>(frameArena, a, 0 , 3, &out1, &contexts[0], &counter);
+    auto* p2 = arena_allocate<SumRangeJobData>(frameArena, b, 0 , 3, &out2, &contexts[0], &counter);
 
-    Job jobs[MAX_JOBS]; // small buffer for now
 
-    
-    JobContext ctx{
-        jobs,
-        &job_count,
-        &frameArena
-    };
 
 
     // Initial jobs = future work → increment counter
     counter.remaining.fetch_add(2, std::memory_order_relaxed);
 
-    size_t job_index = job_count.fetch_add(1, std::memory_order_relaxed);
-    jobs[job_index] = Job{sum_job, p1, &counter,&ctx};
-
-    job_index = job_count.fetch_add(1, std::memory_order_relaxed);
-    jobs[job_index] = Job{sum_job, p2, &counter,&ctx};
-
+    // Pushing the initial jobs
+    push_job(workers[0], Job{sum_job, p1, &counter, &contexts[0], true});
+    push_job(workers[0], Job{sum_job, p2, &counter, &contexts[0], true});
     //---- Launching worker threads ----
     for(unsigned int i =0; i<worker_count; ++i)
     {
-        workers.emplace_back(
+        threads.emplace_back(
             worker_thread,
-            jobs,
-            std::ref(job_count),
-            std::ref(next_job),
+            &workers[i],
+            workers.data(),
+            worker_count,
             &counter
         );
     }
 
 
-    worker_thread(jobs, job_count, next_job, &counter);//Main thread also works as a worker
+    worker_thread(&workers[0], workers.data(),worker_count, &counter);//Main thread also works as a worker
 
 
     //wait for all worker
-    for (auto& t :workers)
+    for (auto& t :threads)
     {
         t.join();
     }
